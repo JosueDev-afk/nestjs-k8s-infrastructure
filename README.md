@@ -15,14 +15,17 @@ VPC /16, 3 AZs
 └── subnets private-data  → RDS PostgreSQL, DocumentDB, ElastiCache
                             (sin ruta a internet; SG solo admite el node SG)
 
-En el clúster (capa platform):
+En el clúster — bootstrap por Terraform (capa platform):
 ├── External Secrets Operator  → Secrets Manager -> Secrets de K8s (IRSA)
-├── kube-prometheus-stack      → métricas + Grafana + Alertmanager
-├── Loki + Promtail            → logs
-├── Tempo + OTel Collector     → trazas (los servicios solo hablan OTLP)
-├── exporters postgres/mongo/redis → métricas de las DBs gestionadas
-└── AWS Load Balancer Controller   → Ingress ALB del api-gateway
+├── AWS Load Balancer Controller   → Ingress ALB del api-gateway
+└── ArgoCD + root Application  → GitOps: a partir de aquí TODO lo demás
+                                 (observabilidad y microservicios) lo
+                                 sincroniza ArgoCD desde nestjs-k8s-gitops
+Capa shared (live/aws/shared/ecr-ci): repos ECR + rol OIDC para GitHub Actions
 ```
+
+> Modelo GitOps completo: ver [ADR-004](docs/adr/004-gitops-argocd.md) y el
+> repo [nestjs-k8s-gitops](https://github.com/JosueDev-afk/nestjs-k8s-gitops).
 
 ## Estructura
 
@@ -46,11 +49,17 @@ aws s3api put-bucket-versioning --bucket <TU-BUCKET-TFSTATE> \
 # Reemplazar CHANGEME-nestjs-k8s-tfstate en live/**/backend.tf y en los
 # data "terraform_remote_state".
 
-# 1. Aplicar por capas, en orden:
+# 1. Capa compartida (una vez): ECR + rol OIDC de CI
+terraform -chdir=live/aws/shared/ecr-ci init && terraform -chdir=live/aws/shared/ecr-ci apply
+
+# 2. Aplicar por capas, en orden:
 for layer in network eks data platform; do
   terraform -chdir=live/aws/dev/$layer init
   terraform -chdir=live/aws/dev/$layer apply
 done
+
+# 3. Rellenar los REPLACE_ME del repo gitops con los outputs (ver su README)
+#    y push: ArgoCD sincroniza observabilidad + microservicios él solo.
 ```
 
 Después del apply, los outputs de `data` (endpoints) se colocan en

@@ -84,6 +84,14 @@ resource "kubernetes_namespace" "app" {
   }
 }
 
+# Lo crea Terraform (no ArgoCD) porque los ExternalSecrets de observabilidad
+# deben existir antes de la primera sincronización del stack.
+resource "kubernetes_namespace" "observability" {
+  metadata {
+    name = "observability"
+  }
+}
+
 # --- IRSA para External Secrets Operator (lectura de Secrets Manager) ---
 module "eso_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
@@ -165,12 +173,22 @@ module "external_secrets" {
         { secret_key = "REDIS_PASSWORD", remote_key = local.data_out.redis_secret_arn, property = "auth_token" },
       ]
     }
+    # Credenciales admin de Grafana (kube-prometheus-stack: grafana.admin.existingSecret)
+    grafana-admin-credentials = {
+      namespace = "observability"
+      data = [
+        { secret_key = "admin-user", remote_key = aws_secretsmanager_secret.grafana_admin.arn, property = "username" },
+        { secret_key = "admin-password", remote_key = aws_secretsmanager_secret.grafana_admin.arn, property = "password" },
+      ]
+    }
   }
 
-  depends_on = [kubernetes_namespace.app]
+  depends_on = [kubernetes_namespace.app, kubernetes_namespace.observability]
 }
 
-# --- Observabilidad (4 señales doradas) ---
+# --- Grafana admin: la password vive en Secrets Manager y llega al clúster
+#     vía ESO (grafana-admin-credentials). El stack de observabilidad ya no
+#     lo gestiona Terraform: lo sincroniza ArgoCD desde el repo gitops. ---
 resource "random_password" "grafana_admin" {
   length  = 24
   special = false
@@ -187,28 +205,93 @@ resource "aws_secretsmanager_secret_version" "grafana_admin" {
   secret_string = jsonencode({ username = "admin", password = random_password.grafana_admin.result })
 }
 
-module "observability" {
-  source = "../../../../modules/k8s-platform/observability"
+# --- ArgoCD (GitOps): Terraform solo hace bootstrap — instala ArgoCD y el
+#     root Application (App-of-Apps); desde ahí todo converge desde
+#     github.com/JosueDev-afk/nestjs-k8s-gitops ---
+locals {
+  gitops_repo_url = "https://github.com/JosueDev-afk/nestjs-k8s-gitops.git"
+  # true cuando el repo gitops sea privado: requiere haber creado antes el
+  # secreto nestjs/<env>/gitops/repo-credentials en Secrets Manager
+  # con JSON {"username":"git","password":"<fine-grained PAT read-only>"}
+  gitops_repo_private = false
+}
 
-  grafana_admin_password = random_password.grafana_admin.result
-  app_namespace          = local.app_namespace
-  retention_days         = 30
+resource "helm_release" "argocd" {
+  name             = "argocd"
+  repository       = "https://argoproj.github.io/argo-helm"
+  chart            = "argo-cd"
+  version          = "7.3.3"
+  namespace        = "argocd"
+  create_namespace = true
+  timeout          = 600
 
-  postgres_exporter = {
-    enabled                = true
-    datasource_secret_name = "postgres-exporter-datasource"
-  }
-  mongodb_exporter = {
-    enabled         = true
-    uri_secret_name = "mongodb-exporter-uri"
-  }
-  redis_exporter = {
-    enabled              = true
-    redis_addr           = local.data_out.redis_endpoint
-    password_secret_name = "redis-exporter-auth"
+  values = [yamlencode({
+    configs = {
+      params = {
+        # dev: sin TLS propio (acceso por port-forward o Ingress con TLS del ALB)
+        "server.insecure" = true
+      }
+    }
+  })]
+}
+
+data "aws_secretsmanager_secret_version" "gitops_repo_creds" {
+  count     = local.gitops_repo_private ? 1 : 0
+  secret_id = "nestjs/${local.env}/gitops/repo-credentials"
+}
+
+resource "kubernetes_secret" "gitops_repo_creds" {
+  count = local.gitops_repo_private ? 1 : 0
+
+  metadata {
+    name      = "gitops-repo-creds"
+    namespace = "argocd"
+    labels = {
+      "argocd.argoproj.io/secret-type" = "repo-creds"
+    }
   }
 
-  depends_on = [module.external_secrets]
+  # repo-creds por prefijo: cubre el repo gitops y el repo de la app
+  data = {
+    type     = "git"
+    url      = "https://github.com/JosueDev-afk"
+    username = jsondecode(data.aws_secretsmanager_secret_version.gitops_repo_creds[0].secret_string).username
+    password = jsondecode(data.aws_secretsmanager_secret_version.gitops_repo_creds[0].secret_string).password
+  }
+
+  depends_on = [helm_release.argocd]
+}
+
+resource "kubernetes_manifest" "root_app" {
+  manifest = {
+    apiVersion = "argoproj.io/v1alpha1"
+    kind       = "Application"
+    metadata = {
+      name       = "root-aws-${local.env}"
+      namespace  = "argocd"
+      finalizers = ["resources-finalizer.argocd.argoproj.io"]
+    }
+    spec = {
+      project = "default"
+      source = {
+        repoURL        = local.gitops_repo_url
+        targetRevision = "main"
+        path           = "apps/aws-${local.env}"
+      }
+      destination = {
+        server    = "https://kubernetes.default.svc"
+        namespace = "argocd"
+      }
+      syncPolicy = {
+        automated = {
+          prune    = true
+          selfHeal = true
+        }
+      }
+    }
+  }
+
+  depends_on = [helm_release.argocd, module.external_secrets]
 }
 
 # --- AWS Load Balancer Controller (Ingress ALB del api-gateway) ---
@@ -256,9 +339,15 @@ output "grafana_admin_secret_arn" {
 }
 
 output "otlp_endpoint" {
-  value = module.observability.otlp_endpoint
+  description = "Endpoint OTLP gRPC para los microservicios (lo despliega ArgoCD)"
+  value       = "http://otel-collector-opentelemetry-collector.observability.svc:4317"
 }
 
 output "app_namespace" {
   value = local.app_namespace
+}
+
+output "argocd_bootstrap" {
+  description = "Acceso inicial a la UI de ArgoCD"
+  value       = "kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d ; kubectl -n argocd port-forward svc/argocd-server 8080:80"
 }
