@@ -42,27 +42,42 @@ Cambiar de instancia floci: `FLOCI_ENDPOINT=http://otra-url scripts/floci.sh ...
 Se dejó fuera `enable_interface_endpoints` (los VPC interface endpoints suelen ser
 lo primero que un emulador no cubre).
 
-## EKS + platform (ArgoCD) — no en un solo apply
+## EKS + platform (ArgoCD) — `scripts/floci-eks-bootstrap.sh`
 
-floci **sí** levanta un k3s real por cada `eks:CreateCluster`, así que la capa
-`platform` es testeable, pero necesita el kubeconfig del clúster *después* de
-crearlo (los providers `helm`/`kubernetes` no pueden configurarse en el mismo
-apply que crea el clúster — la misma restricción que con EKS real). Flujo manual:
+floci levanta un **k3s real** por cada `eks:CreateCluster`, así que la capa
+`platform` (ArgoCD + GitOps) es testeable. El script automatiza el encadenado:
 
 ```bash
-export AWS_ENDPOINT_URL=http://floci-floci-bovybt-755121-76-13-24-93.sslip.io
-export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1
-
-aws eks create-cluster --name nestjs-floci \
-  --role-arn arn:aws:iam::000000000000:role/eks-role \
-  --resources-vpc-config subnetIds=<subnet-de-la-red-floci>
-aws eks update-kubeconfig --name nestjs-floci      # floci devuelve el kubeconfig del k3s
-kubectl get nodes                                   # k3s real
-
-# A partir de aquí se instalan ArgoCD/observabilidad con helm/kubectl apuntando
-# a ese kubeconfig, o reutilizando los módulos k8s-platform/* con un provider
-# kubernetes/helm que lea ese contexto.
+scripts/floci-eks-bootstrap.sh
 ```
+
+Hace, de forma idempotente:
+1. `aws eks create-cluster` → floci arranca un nodo k3s; espera `ACTIVE`.
+2. Genera el kubeconfig y lo hace usable **desde fuera de la VPS**: floci
+   reporta el API server como `https://localhost:6500`, pero el puerto está
+   expuesto en el host real — el script reescribe el `server`, salta la
+   verificación TLS (el cert es para `localhost`) y empotra las credenciales
+   en el `exec` para que `kubectl` no dependa del entorno.
+3. Instala ArgoCD por Helm.
+4. Aplica el root Application → ArgoCD sincroniza el repo gitops.
+
+> Los providers `helm`/`kubernetes` no pueden configurarse en el mismo apply que
+> crea el clúster (misma restricción que con EKS real), por eso el bootstrap va
+> por script y no por Terraform.
+
+### Resultado verificado (julio 2026)
+
+El nodo k3s (`v1.34.1+k3s1`) queda `Ready`, ArgoCD instala y registra las 10
+Applications del repo gitops. Casi todas llegan a `Synced`; observabilidad
+(tempo, otel-collector, promtail, exporters, loki) sube a `Healthy/Progressing`.
+
+**Límite conocido:** los pods de `microservices` quedan en
+`Pending / InvalidImageName` — el `values/aws-dev/microservices.yaml` trae el
+placeholder `REPLACE_ME_ECR_REGISTRY/…:bootstrap`. Los objetos K8s sí se crean
+(ArgoCD: "successfully synced"); solo falta que existan **imágenes reales** en
+el ECR de floci. Para cerrarlo hace falta Docker: construir las 4 imágenes y
+subirlas al registry de floci (`terraform -chdir=live/floci output -raw
+ecr_registry_url`), y sustituir el placeholder en el repo gitops.
 
 ## Limpieza
 
