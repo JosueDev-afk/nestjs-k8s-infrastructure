@@ -15,7 +15,14 @@ FLOCI_HOST="${FLOCI_HOST:-floci-floci-bovybt-755121-76-13-24-93.sslip.io}"
 FLOCI_ENDPOINT="${FLOCI_ENDPOINT:-http://${FLOCI_HOST}}"
 CLUSTER="${CLUSTER:-nestjs-floci}"
 KUBECONFIG_OUT="${KUBECONFIG_OUT:-$HOME/.kube/floci}"
-GITOPS_ROOT_APP="${GITOPS_ROOT_APP:-https://raw.githubusercontent.com/JosueDev-afk/nestjs-k8s-gitops/main/bootstrap/root-app-aws-dev.yaml}"
+# DEPLOY_MODE=lean (default): solo ArgoCD + microservicios. La observabilidad
+#   completa (kube-prometheus-stack/loki/tempo/…) satura el disco de una VPS
+#   pequeña y dispara disk-pressure en k3s — usar DEPLOY_MODE=full solo con
+#   holgura de disco real.
+DEPLOY_MODE="${DEPLOY_MODE:-lean}"
+GITOPS_RAW="https://raw.githubusercontent.com/JosueDev-afk/nestjs-k8s-gitops/main"
+GITOPS_ROOT_APP="${GITOPS_ROOT_APP:-$GITOPS_RAW/bootstrap/root-app-aws-dev.yaml}"
+GITOPS_MICROSERVICES_APP="${GITOPS_MICROSERVICES_APP:-$GITOPS_RAW/apps/aws-dev/microservices.yaml}"
 ARGOCD_CHART_VERSION="${ARGOCD_CHART_VERSION:-7.3.3}"
 
 # floci no valida credenciales: cualquier valor "test" sirve.
@@ -74,31 +81,52 @@ PY
 kubectl get nodes
 
 # --- 3. ArgoCD --------------------------------------------------------------
+# Abortar pronto si el nodo está en disk-pressure: nada se programaría y el
+# helm se colgaría en los hooks (como pasó al saturarse el disco de la VPS).
+if kubectl get nodes -o jsonpath='{.items[*].spec.taints[*].key}' 2>/dev/null | grep -q disk-pressure; then
+  echo "✗ El nodo k3s está en disk-pressure: la VPS no tiene disco libre." >&2
+  echo "  Libera disco (o reinicia la instancia floci) y reintenta. Ver README." >&2
+  exit 1
+fi
+
 helm repo add argo https://argoproj.github.io/argo-helm >/dev/null 2>&1 || true
 helm repo update argo >/dev/null
-echo "→ instalando ArgoCD…"
-helm upgrade --install argocd argo/argo-cd --version "$ARGOCD_CHART_VERSION" \
-  --namespace argocd --create-namespace \
-  --set 'configs.params.server\.insecure=true' >/dev/null
+# Idempotente: si el release ya está 'deployed', no se re-lanza (re-ejecutar el
+# upgrade re-corre los hooks pre-upgrade y puede dejar el namespace inconsistente).
+if [ "$(helm -n argocd status argocd -o json 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["info"]["status"])' 2>/dev/null)" = "deployed" ]; then
+  echo "→ ArgoCD ya instalado (deployed), omito helm"
+else
+  echo "→ instalando ArgoCD (lean: sin dex/notifications/applicationset)…"
+  helm upgrade --install argocd argo/argo-cd --version "$ARGOCD_CHART_VERSION" \
+    --namespace argocd --create-namespace --timeout 10m --wait \
+    --set 'configs.params.server\.insecure=true' \
+    --set dex.enabled=false \
+    --set notifications.enabled=false \
+    --set applicationSet.enabled=false >/dev/null
+fi
 kubectl -n argocd rollout status deploy/argocd-server --timeout=180s
 
-# --- 4. root Application (App-of-Apps) --------------------------------------
+# --- 4. Application(es) -----------------------------------------------------
 # El namespace de la app lo crearía Terraform (capa platform); en floci lo
 # creamos aquí para que la Application microservices pueda sincronizar.
 kubectl create namespace microservices --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-kubectl apply -f "$GITOPS_ROOT_APP"
+if [ "$DEPLOY_MODE" = "full" ]; then
+  echo "→ DEPLOY_MODE=full: root App-of-Apps (observabilidad incluida — necesita disco)"
+  kubectl apply -f "$GITOPS_ROOT_APP"
+else
+  echo "→ DEPLOY_MODE=lean: solo la Application microservices"
+  kubectl apply -f "$GITOPS_MICROSERVICES_APP"
+fi
 
 cat <<EOF
 
-✔ Bootstrap listo. ArgoCD sincronizando el repo gitops.
+✔ Bootstrap listo (modo: $DEPLOY_MODE). ArgoCD sincronizando el repo gitops.
 
   export KUBECONFIG=$KUBECONFIG_OUT
   kubectl -n argocd get applications
   # UI: kubectl -n argocd port-forward svc/argocd-server 8080:80   (usuario admin)
   kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo
 
-Nota: los pods de microservices quedarán en InvalidImageName hasta que existan
-imágenes reales en el ECR de floci. Construir+push a \$(terraform -chdir=live/floci
-output -raw ecr_registry_url) con Docker, y sustituir REPLACE_ME_ECR_REGISTRY en
-values/aws-dev/microservices.yaml del repo gitops.
+Pendiente para que los pods arranquen: imágenes reales en el registry de floci
+(workflow ci.yml en modo floci) y los Secrets *-secrets (hoy los crearía ESO).
 EOF

@@ -48,8 +48,17 @@ floci levanta un **k3s real** por cada `eks:CreateCluster`, así que la capa
 `platform` (ArgoCD + GitOps) es testeable. El script automatiza el encadenado:
 
 ```bash
-scripts/floci-eks-bootstrap.sh
+scripts/floci-eks-bootstrap.sh              # lean: ArgoCD + microservicios
+DEPLOY_MODE=full scripts/floci-eks-bootstrap.sh   # + observabilidad (necesita disco)
 ```
+
+> **Disco de la VPS.** El stack completo de observabilidad (kube-prometheus-stack,
+> grafana, loki, tempo, promtail, exporters) tira varios GB de imágenes y satura
+> el disco de una VPS pequeña; k3s entra en `disk-pressure` y deja de programar
+> pods (todo queda `Pending`/`Evicted`). Por eso el modo por defecto es **lean**.
+> Si ves `disk-pressure`: libera disco en la VPS — lo más rápido es reiniciar la
+> instancia floci (es efímera) o `terraform -chdir=live/floci destroy` para soltar
+> los recursos emulados (RDS, etc.), y reintentar en modo lean.
 
 Hace, de forma idempotente:
 1. `aws eks create-cluster` → floci arranca un nodo k3s; espera `ACTIVE`.
