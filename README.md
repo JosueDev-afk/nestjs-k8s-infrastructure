@@ -85,6 +85,17 @@ Después del apply, los outputs de `data` (endpoints) se colocan en
   `transit_encryption_enabled`).
 - Nada público excepto el ALB; API server de prod restringido por CIDR.
 
+## Pruebas sin AWS real (floci)
+
+`live/floci/` aplica los mismos módulos contra un emulador de AWS
+([floci](https://floci.io)) desplegado en una VPS — útil para validar la IaC sin
+cuenta ni costos. Verificado: ECR, VPC de 3 niveles y RDS PostgreSQL aplican
+limpio. Ver [live/floci/README.md](live/floci/README.md).
+
+```bash
+scripts/floci.sh apply -auto-approve -var enable_network=true -var enable_data=true
+```
+
 ## Siguientes pasos (fuera de esta fase)
 
 - Migración de datos (DMS / dump-restore) — ver plan en el repo de la app.
