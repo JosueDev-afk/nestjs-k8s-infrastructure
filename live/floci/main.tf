@@ -76,6 +76,13 @@ module "rds" {
   tags                       = local.tags
 }
 
+# NOTA: DocumentDB y ElastiCache NO se emulan completos en floci community.
+# El apply falla con UnsupportedOperation:
+#   - DocDB:       DescribeGlobalClusters (lo llama el provider al crear el cluster)
+#   - ElastiCache: CreateCacheSubnetGroup
+# RDS sí funciona de punta a punta. Para product/notification en floci, usar
+# datastores in-cluster (mongodb/redis del chart) en lugar de servicios gestionados.
+
 output "floci_endpoint" {
   value = var.floci_endpoint
 }

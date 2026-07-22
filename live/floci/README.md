@@ -37,7 +37,13 @@ Cambiar de instancia floci: `FLOCI_ENDPOINT=http://otra-url scripts/floci.sh ...
 |---|---|---|
 | ECR (4 repos + lifecycle) | `enable_ecr` (on) | ✅ apply; registry Docker real en `…:5100` |
 | VPC 3 niveles + NAT + endpoint S3 | `enable_network` | ✅ 32 recursos (ec2 emulado sorprendentemente completo) |
-| RDS PostgreSQL + param group + SG | `enable_data` | ✅ instancia `available` (~90 s; contenedor real) |
+| RDS PostgreSQL + param group + SG | `enable_data` | ✅ instancia `available` (~90 s; contenedor real); pods conectan a ella (IP enrutable, p. ej. `10.0.1.20:7001`) |
+| DocumentDB | — | ❌ floci community: `UnsupportedOperation: DescribeGlobalClusters` al crear el cluster |
+| ElastiCache Redis | — | ❌ floci community: `UnsupportedOperation: CreateCacheSubnetGroup` |
+
+> Para product-service (Mongo) y notification-service (Redis) en floci: usar los
+> datastores **in-cluster** del chart (`mongodb.enabled`/`redis.enabled`), ya que
+> floci community no aprovisiona DocumentDB/ElastiCache vía Terraform. RDS sí.
 
 Se dejó fuera `enable_interface_endpoints` (los VPC interface endpoints suelen ser
 lo primero que un emulador no cubre).
